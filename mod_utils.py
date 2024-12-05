@@ -1,4 +1,7 @@
 from miasm.arch.x86.arch import mn_x86
+from miasm.analysis.binary import Container
+from miasm.analysis.machine import Machine
+from miasm.core.locationdb import LocationDB
 from future.utils import viewitems, viewvalues
 from miasm.core.utils import encode_hex
 from miasm.core.graph import DiGraph
@@ -24,9 +27,21 @@ def save_cfg(cfg, name):
     subprocess.call(["rm", name])
 
 
+def print_disassembly(bytes):
+    machine = Machine('x86_32')
+    loc_db = LocationDB()
+    c = Container.from_string(bytes, loc_db)
+    mdis = machine.dis_engine(c.bin_stream, loc_db=loc_db)
+    print(mdis.dis_multiblock(0))
+
+
 def patch_gen(instrs, loc_db, nop_addrs, link):
     final_patch = b""
     start_addr = instrs[0].offset
+    if instrs[-1].name.startswith('J'):
+        instrs.pop()
+    if instrs[-1].name.startswith('CMP'):
+        instrs.pop()
 
     for instr in instrs:
         #omitting useless instructions
@@ -53,8 +68,8 @@ def patch_gen(instrs, loc_db, nop_addrs, link):
     jmp_patches = b""
     # cleaning the control flow by patching with real jmps locs
     if 'cond' in link:
-        t_addr = int(link['true_next'], 16)
-        f_addr = int(link['false_next'], 16)
+        t_addr = link['true_next']
+        f_addr = link['false_next']
         jcc = link['cond'].replace('CMOV', 'J')
         _log.info("%s %#x" % (jcc, t_addr))
         _log.info("JMP %#x" % f_addr)
@@ -68,7 +83,7 @@ def patch_gen(instrs, loc_db, nop_addrs, link):
         _log.debug("jmp patches : %s; %s" % (patch1_str, patch2_str))
 
     else:
-        n_addr = int(link['next'], 16)
+        n_addr = link['next']
         _log.info("JMP %#x" % n_addr)
 
         patch_str = "JMP %s" % rel(n_addr, patch_addr)
@@ -88,16 +103,15 @@ def get_cff_info(asmcfg):
         offset = asmcfg.loc_db.get_location_offset(blk.loc_key)
         preds[offset] = asmcfg.predecessors(blk.loc_key)
     # pre-dispatcher is the one with max predecessors
-    pre_dispatcher = sorted(preds, key=lambda key: len(preds[key]), reverse=True)[0]
+    dispatcher = sorted(preds, key=lambda key: len(preds[key]), reverse=True)[0]
     # dispatcher is the one which suceeds pre-dispatcher
-    dispatcher = asmcfg.successors(asmcfg.loc_db.get_offset_location(pre_dispatcher))[0]
-    dispatcher = asmcfg.loc_db.get_location_offset(dispatcher)
+    pre_dispatcher = dispatcher
 
     # relevant blocks are those which preceed the pre-dispatcher
     relevant_blocks = []
     for loc in preds[pre_dispatcher]:
         offset = asmcfg.loc_db.get_location_offset(loc)
-        relevant_blocks.append(get_block_father(asmcfg, offset))
+        relevant_blocks.append(offset)
 
     return relevant_blocks, dispatcher, pre_dispatcher
 
@@ -151,33 +165,41 @@ def get_phi_vars(ircfg,loc_db,mdis):
     return res
 
 
-def find_var_asg(ircfg, var,loc_db,mdis):
-    val_list = []
-    res = {}
+def _find_var_asg(ircfg, var):
     for lbl, irblock in viewitems(ircfg.blocks):
         for assignblk in irblock:
-            result = set(assignblk).intersection(var)
-            if not result:
+            found = False
+            for exp in assignblk:
+                if isinstance(exp, ExprId) and exp.name.startswith(var):
+                    found = True
+            if not found:
                 continue
-            else:
-                dst, src = assignblk.items()[0]
-                if isinstance(src, ExprInt):
-                    res['next'] = int(src)
-                    val_list += [int(src)]
-                elif isinstance(src, ExprSlice):
-                    phi_vals = get_phi_vars(ircfg,loc_db,mdis)
-                    if not phi_vals:
-                        continue
-                    res['true_next'] = phi_vals[0]
-                    res['false_next'] = phi_vals[1]
-                    val_list += phi_vals
-                elif isinstance(src,ExprId):
-                    phi_vals = get_phi_vars(ircfg,None,None)
-                    if not phi_vals:
-                        continue
-                    res['true_next'] = phi_vals[0]
-                    res['false_next'] = phi_vals[1]
-                    val_list += phi_vals
+            yield assignblk
+
+
+def find_var_asg(ircfg,var,loc_db,mdis):
+    val_list = []
+    res = {}
+    # addr = loc_db.get_location_offset(ircfg.heads()[0])
+    for assignblk in _find_var_asg(ircfg, var):
+        dst, src = assignblk.items()[0]
+        if isinstance(src, ExprInt):
+            res['next'] = int(src)
+            val_list += [int(src)]
+        elif isinstance(src, ExprSlice):
+            phi_vals = get_phi_vars(ircfg,loc_db,mdis)
+            if not phi_vals:
+                continue
+            res['true_next'] = phi_vals[0]
+            res['false_next'] = phi_vals[1]
+            val_list += phi_vals
+        elif isinstance(src,ExprId) or isinstance(src, ExprOp):
+            phi_vals = get_phi_vars(ircfg,None,None)
+            if not phi_vals:
+                continue
+            res['true_next'] = phi_vals[0]
+            res['false_next'] = phi_vals[1]
+            val_list += phi_vals
     return res, val_list
 
 
@@ -187,7 +209,13 @@ def find_state_var_usedefs(ircfg, search_var):
     digraph = DiGraphDefUse(reachings)
     # the state var always a leaf
     for leaf in digraph.leaves():
-        if leaf.var == search_var:
-            for x in (digraph.reachable_parents(leaf)):
-                var_addrs.add(ircfg.get_block(x.label)[x.index].instr.offset)
+        try:
+            if leaf.var.name.startswith(search_var):
+                for x in (digraph.reachable_parents(leaf)):
+                    var_addrs.add(ircfg.get_block(x.label)[x.index].instr.offset)
+        except AttributeError as e:
+            continue
+    if not var_addrs:
+        for assignblk in _find_var_asg(ircfg, search_var):
+            var_addrs.add(assignblk.instr.offset)
     return var_addrs

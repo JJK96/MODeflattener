@@ -1,3 +1,1 @@
-future==0.18.2
-git+git://github.com/cea-sec/miasm@069440e#egg=miasm
-pyparsing==2.4.7
+miasm

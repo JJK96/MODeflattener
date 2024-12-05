@@ -7,6 +7,7 @@ from miasm.expression.expression import *
 from miasm.core.asmblock import *
 from miasm.arch.x86.arch import mn_x86
 from miasm.core.utils import encode_hex
+from collections import defaultdict, OrderedDict
 
 from argparse import ArgumentParser
 import time
@@ -44,13 +45,188 @@ def calc_flattening_score(asm_graph):
 
 # callback to stop disassembling when it encounters any jump
 def stop_on_jmp(mdis, cur_bloc, offset_to_dis):
-    jmp_instr_check = cur_bloc.lines[-1].name in ['JMP','JZ','JNZ']
+    jmp_instr_check = cur_bloc.lines[-1].name.startswith('J')
 
     if jmp_instr_check:
         cur_bloc.bto.clear()
         offset_to_dis.clear()
 
+def is_cmp_jmp_block(block):
+    """ Check if the block consists of a comparison and a jump """
+    if not len(block.lines) == 2:
+        return False
+    if block.lines[0].name == 'CMP' and block.lines[1].name.startswith('J'):
+        val = block.lines[0].args[1]
+        if val.is_int() and val.size == 32:
+            return True
+    return False
+
+
+def get_state_var(block, asmcfg):
+    successors = asmcfg.successors(block.loc_key)
+    if not successors:
+        return None
+    succ_addr = successors[0]
+    succ = asmcfg.loc_key_to_block(succ_addr)
+    instr = succ.lines[0]
+    if instr.name != 'CMP':
+        return None
+    state_var = instr.args[0].name
+    return state_var
+
+
+def get_matching_target(block):
+    if block.lines[1].name == 'JZ':
+        for succ in block.bto:
+            if succ.c_t == AsmConstraint.c_to:
+                break
+    elif block.lines[1].name == 'JNZ':
+        for succ in block.bto:
+            if succ.c_t == AsmConstraint.c_next:
+                break
+    else:
+        return None
+    return succ.loc_key
+
+
 def deflat(ad, func_info):
+    main_asmcfg, main_ircfg = func_info
+    reg_counts = defaultdict(int)
+    backbone = {}
+    cmps = []
+    for block in main_asmcfg.blocks:
+        if is_cmp_jmp_block(block):
+            cmps.append(block)
+            target = get_matching_target(block)
+            if target:
+                block_num = block.lines[0].args[1].arg
+                target = main_asmcfg.loc_key_to_block(target)
+                backbone[block_num] = target
+            cmp = block.lines[0]
+            reg = cmp.args[0].name
+            reg_counts[reg] += 1
+
+    val_list = []
+    fixed_cfg = {}
+    val_list = []
+    rel_blk_info = {}
+
+    machine = Machine(cont.arch)
+
+    head_loc = main_asmcfg.heads()[0]
+    head = main_asmcfg.loc_key_to_block(head_loc)
+
+    todo = [head]
+    done = set()
+
+    while todo:
+        block = todo.pop(0)
+        if block in done:
+            continue
+        addr = main_asmcfg.loc_db.get_location_offset(block.loc_key)
+        _log.debug("Getting info for relevant block @ %#x"%addr)
+        state_var = get_state_var(block, main_asmcfg)
+        if not state_var:
+            for succ in main_asmcfg.successors(block.loc_key):
+                next_block = main_asmcfg.loc_key_to_block(succ)
+                if next_block not in done:
+                    todo.append(next_block)
+            continue
+        loc_db = LocationDB()
+        mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
+        mdis.dis_block_callback = stop_on_jmp
+        asmcfg = mdis.dis_multiblock(addr)
+
+        lifter = machine.lifter_model_call(loc_db)
+        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+        # ircfg_simplifier = IRCFGSimplifierCommon(lifter)
+        # ircfg_simplifier.simplify(ircfg, addr)
+        #save_cfg(ircfg,'ir_%x'%addr)
+
+        # marking the instructions affecting the state variable as nop_addrs
+        nop_addrs = find_state_var_usedefs(ircfg, state_var)
+        rel_blk_info[addr] = (asmcfg, nop_addrs)
+
+        head = loc_db.get_offset_location(addr)
+        ssa_simplifier = IRCFGSimplifierSSA(lifter)
+        ssa = ssa_simplifier.ircfg_to_ssa(ircfg, head)
+        #we only use do_propagate_expressions ssa simp pass
+        ssa_simplifier.do_propagate_expressions(ssa, head)
+        #save_cfg(ircfg, 'ssa_%x'%addr)
+
+        # find the possible values of the state variable
+        var_asg, tmpval_list = find_var_asg(ircfg,state_var,loc_db,mdis)
+        _log.debug('%#x %s' % (addr, {x:hex(y) for x,y in var_asg.items()}))
+
+        for next in var_asg.values():
+            next_block = backbone[next]
+            if next_block not in done:
+                todo.append(next_block)
+        # adding all the possible values to a global list
+        val_list += tmpval_list
+
+        last_blk = list(asmcfg.blocks)[-1]
+        # checking the type of relevant blocks on the basis of no. of possible values
+        if len(var_asg) == 1:
+            #map value of state variable in rel block
+            fixed_cfg[hex(addr)] = var_asg
+        elif len(var_asg) > 1:
+            #extracting the condition from the last 3rd line
+            cond_mnem = last_blk.lines[-2].name
+            _log.debug('cond used: %s' % cond_mnem)
+            # if cond_mnem=='MOV':
+            #     cond_mnem = last_blk.lines[-3].name
+            var_asg['cond'] = cond_mnem
+            # map the conditions and possible values dictionary to the cfg info
+            fixed_cfg[hex(addr)] = var_asg
+        else:
+            _log.error("no state variable assignments found for relevant block @ %#x" % addr)
+            # return empty patches as deobfuscation failed!!
+            return {}
+        done.add(block)
+        
+    _log.debug('val_list: ' + ', '.join([hex(val) for val in val_list]))
+
+    _log.debug('***** BACKBONE *****\n' + pprint.pformat(backbone))
+
+    for offset, link in fixed_cfg.items():
+        if 'cond' in link:
+            tval = fixed_cfg[offset]['true_next']
+            fval = fixed_cfg[offset]['false_next']
+            fixed_cfg[offset]['true_next'] = main_asmcfg.loc_db.get_location_offset(backbone[tval].loc_key)
+            fixed_cfg[offset]['false_next'] = main_asmcfg.loc_db.get_location_offset(backbone[fval].loc_key)
+        elif 'next' in link:
+            fixed_cfg[offset]['next'] = main_asmcfg.loc_db.get_location_offset(backbone[link['next']].loc_key)
+
+    _log.debug('******FIXED CFG*******\n' + pprint.pformat(fixed_cfg))
+
+    patches = OrderedDict()
+
+    for cmp in cmps:
+        start, end = cmp.get_range()
+        patches[start] = b"\x90" * (end-start)
+
+    for addr in rel_blk_info.keys():
+        _log.info('=> cleaning relevant block @ %#x' % addr)
+        asmcfg, nop_addrs = rel_blk_info[addr]
+        link = fixed_cfg[hex(addr)]
+        instrs = [instr for blk in asmcfg.blocks for instr in blk.lines]
+        last_instr = instrs[-1]
+        end_addr = last_instr.offset + last_instr.l
+        # calculate original length of block before patching
+        orig_len = end_addr - addr
+        # nop the jmp to pre-dispatcher
+        # nop_addrs.add(last_instr.offset)
+        _log.debug('nop_addrs: ' + ', '.join([hex(addr) for addr in nop_addrs]))
+        patch = patch_gen(instrs, asmcfg.loc_db, nop_addrs, link)
+        patch = patch.ljust(orig_len, b"\x90")
+        patches[addr] = patch
+        _log.debug('patch generated %s\n' % encode_hex(patch))
+
+    return patches
+
+
+def deflat1(ad, func_info):
     main_asmcfg, main_ircfg = func_info
 
     # get flattening info
@@ -129,7 +305,8 @@ def deflat(ad, func_info):
         else:
             _log.error("no state variable assignments found for relevant block @ %#x" % addr)
             # return empty patches as deobfuscation failed!!
-            return {}
+            continue
+            # return {}
 
 
     _log.debug('val_list: ' + ', '.join([hex(val) for val in val_list]))
@@ -156,10 +333,10 @@ def deflat(ad, func_info):
         if 'cond' in link:
             tval = fixed_cfg[offset]['true_next']
             fval = fixed_cfg[offset]['false_next']
-            fixed_cfg[offset]['true_next'] = backbone[tval]
-            fixed_cfg[offset]['false_next'] = backbone[fval]
+            fixed_cfg[offset]['true_next'] = main_asmcfg.loc_db.get_location_offset(backbone[tval])
+            fixed_cfg[offset]['false_next'] = main_asmcfg.loc_db.get_location_offset(backbone[fval])
         elif 'next' in link:
-            fixed_cfg[offset]['next'] = backbone[link['next']]
+            fixed_cfg[offset]['next'] = main_asmcfg.loc_db.get_location_offset(backbone[link['next']])
         else:
             # the tail doesn't has any condition
             tail = int(offset, 16)
@@ -201,7 +378,6 @@ def deflat(ad, func_info):
     return patches
 
 
-
 if __name__ == '__main__':
     parser = ArgumentParser("modeflattener")
     parser.add_argument('filename', help="file to deobfuscate")
@@ -235,18 +411,15 @@ if __name__ == '__main__':
     if cont.arch not in supported_arch:
         _log.error("Architecture unsupported : %s" % cont.arch)
         exit(1)
-    try:
-        if args.baseaddr:
-            _log.info('Base Address:'+args.baseaddr)
-            baseaddr=int(args.baseaddr,16)
-        elif cont.executable.isPE():
-            baseaddr=0x400C00
-            _log.info('Base Address:%x'%baseaddr)
-    except AttributeError:
-        section_ep = cont.bin_stream.bin.virt.parent.getsectionbyvad(cont.entry_point).sh
+    if args.baseaddr:
+        _log.info('Base Address:'+args.baseaddr)
+        baseaddr=int(args.baseaddr,16)
+    else:
+        section_ep = cont.bin_stream.bin.virt.parent.getsectionbyvad(cont.entry_point)
         baseaddr = section_ep.addr - section_ep.offset
         _log.info('Base Address:%x'%baseaddr)
 
+    text_offset = cont.bin_stream.bin.virt.parent.SHList.shlist[0].offset
     machine = Machine(cont.arch)
     mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
 
@@ -285,6 +458,7 @@ if __name__ == '__main__':
         asmcfg = all_funcs_blocks[ad][0]
         score = calc_flattening_score(asmcfg)
         if score > 0.9:
+            print(score)
             print('-------------------------')
             print('|    func : %#x    |' % ad)
             print('-------------------------')
@@ -293,7 +467,8 @@ if __name__ == '__main__':
 
             if patches:
                 for offset, data in patches.items():
-                    fpatch.seek(offset - baseaddr)
+                    # print_disassembly(data)
+                    fpatch.seek(offset - baseaddr + text_offset)
                     fpatch.write(data)
 
                 fcn_end_time = time.time() - fcn_start_time
