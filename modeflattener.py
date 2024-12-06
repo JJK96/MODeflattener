@@ -35,6 +35,8 @@ def calc_flattening_score(asm_graph):
     for head in asm_graph.heads_iter():
         dominator_tree = asm_graph.compute_dominator_tree(head)
         for block in asm_graph.blocks:
+            if len(block.lines) == 0:
+                return score
             block_key = asm_graph.loc_db.get_offset_location(block.lines[0].offset)
             dominated = set(
                 [block_key] + [b for b in dominator_tree.walk_depth_first_forward(block_key)])
@@ -53,21 +55,34 @@ def stop_on_jmp(mdis, cur_bloc, offset_to_dis):
 
 def is_cmp_jmp_block(block):
     """ Check if the block consists of a comparison and a jump """
-    if not len(block.lines) == 2:
+    # offset = block.get_range()[0]
+    # if offset == 0x10009e63:
+    #     breakpoint()
+    if not (2 <= len(block.lines) <= 3):
         return False
-    if block.lines[0].name == 'CMP' and block.lines[1].name.startswith('J'):
-        val = block.lines[0].args[1]
-        if val.is_int() and val.size == 32:
-            return True
-    return False
+    has_cmp = False
+    has_jmp = False
+    for line in block.lines:
+        if line.name == 'CMP':
+            val = line.args[1]
+            if val.is_int() and val.size == 32:
+                has_cmp = True
+        elif line.name.startswith('J'):
+            has_jmp = True
+    return has_cmp and has_jmp
 
 
-def get_state_var(block, asmcfg):
-    successors = asmcfg.successors(block.loc_key)
+def get_state_var(asmcfg, main_asmcfg):
+    instrs = [instr for block in asmcfg.blocks for instr in block.lines]
+    if len(instrs) > 2 and instrs[-2].name == 'CMP':
+        return instrs[-2].args[0].name
+    block_offset = list(asmcfg.blocks)[-1].get_range()[0]
+    block = main_asmcfg.getby_offset(block_offset)
+    successors = main_asmcfg.successors(block.loc_key)
     if not successors:
         return None
     succ_addr = successors[0]
-    succ = asmcfg.loc_key_to_block(succ_addr)
+    succ = main_asmcfg.loc_key_to_block(succ_addr)
     instr = succ.lines[0]
     if instr.name != 'CMP':
         return None
@@ -76,11 +91,11 @@ def get_state_var(block, asmcfg):
 
 
 def get_matching_target(block):
-    if block.lines[1].name == 'JZ':
+    if block.lines[-1].name == 'JZ':
         for succ in block.bto:
             if succ.c_t == AsmConstraint.c_to:
                 break
-    elif block.lines[1].name == 'JNZ':
+    elif block.lines[-1].name == 'JNZ':
         for succ in block.bto:
             if succ.c_t == AsmConstraint.c_next:
                 break
@@ -91,7 +106,6 @@ def get_matching_target(block):
 
 def deflat(ad, func_info):
     main_asmcfg, main_ircfg = func_info
-    reg_counts = defaultdict(int)
     backbone = {}
     cmps = []
     for block in main_asmcfg.blocks:
@@ -99,12 +113,12 @@ def deflat(ad, func_info):
             cmps.append(block)
             target = get_matching_target(block)
             if target:
-                block_num = block.lines[0].args[1].arg
+                for line in block.lines:
+                    if line.name == 'CMP':
+                        block_num = line.args[1].arg
                 target = main_asmcfg.loc_key_to_block(target)
                 backbone[block_num] = target
             cmp = block.lines[0]
-            reg = cmp.args[0].name
-            reg_counts[reg] += 1
 
     val_list = []
     fixed_cfg = {}
@@ -125,17 +139,22 @@ def deflat(ad, func_info):
             continue
         addr = main_asmcfg.loc_db.get_location_offset(block.loc_key)
         _log.debug("Getting info for relevant block @ %#x"%addr)
-        state_var = get_state_var(block, main_asmcfg)
-        if not state_var:
-            for succ in main_asmcfg.successors(block.loc_key):
-                next_block = main_asmcfg.loc_key_to_block(succ)
-                if next_block not in done:
-                    todo.append(next_block)
-            continue
         loc_db = LocationDB()
         mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
         mdis.dis_block_callback = stop_on_jmp
         asmcfg = mdis.dis_multiblock(addr)
+        for block in asmcfg.blocks:
+            done.add(asmcfg.loc_db.get_location_offset(block.loc_key))
+        state_var = get_state_var(asmcfg, main_asmcfg)
+        if not state_var:
+            block_offset = list(asmcfg.blocks)[-1].get_range()[0]
+            block = main_asmcfg.getby_offset(block_offset)
+            for succ in main_asmcfg.successors(block.loc_key):
+                succ_addr = main_asmcfg.loc_db.get_location_offset(succ)
+                if succ_addr not in done:
+                    next_block = main_asmcfg.loc_key_to_block(succ)
+                    todo.append(next_block)
+            continue
 
         lifter = machine.lifter_model_call(loc_db)
         ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
@@ -160,7 +179,8 @@ def deflat(ad, func_info):
 
         for next in var_asg.values():
             next_block = backbone[next]
-            if next_block not in done:
+            next_block_addr = main_asmcfg.loc_db.get_location_offset(next_block.loc_key)
+            if next_block_addr not in done:
                 todo.append(next_block)
         # adding all the possible values to a global list
         val_list += tmpval_list
@@ -171,11 +191,13 @@ def deflat(ad, func_info):
             #map value of state variable in rel block
             fixed_cfg[hex(addr)] = var_asg
         elif len(var_asg) > 1:
+            cond_instr = -2
             #extracting the condition from the last 3rd line
-            cond_mnem = last_blk.lines[-2].name
+            cond_mnem = last_blk.lines[cond_instr].name
             _log.debug('cond used: %s' % cond_mnem)
-            # if cond_mnem=='MOV':
-            #     cond_mnem = last_blk.lines[-3].name
+            while not cond_mnem.startswith('C'):
+                cond_instr -= 1
+                cond_mnem = last_blk.lines[cond_instr].name
             var_asg['cond'] = cond_mnem
             # map the conditions and possible values dictionary to the cfg info
             fixed_cfg[hex(addr)] = var_asg
@@ -183,7 +205,7 @@ def deflat(ad, func_info):
             _log.error("no state variable assignments found for relevant block @ %#x" % addr)
             # return empty patches as deobfuscation failed!!
             return {}
-        done.add(block)
+        done.add(addr)
         
     _log.debug('val_list: ' + ', '.join([hex(val) for val in val_list]))
 
@@ -458,7 +480,6 @@ if __name__ == '__main__':
         asmcfg = all_funcs_blocks[ad][0]
         score = calc_flattening_score(asmcfg)
         if score > 0.9:
-            print(score)
             print('-------------------------')
             print('|    func : %#x    |' % ad)
             print('-------------------------')

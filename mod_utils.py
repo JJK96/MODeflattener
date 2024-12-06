@@ -136,6 +136,7 @@ def get_phi_vars(ircfg,loc_db,mdis):
     res = []
     blks = list(ircfg.blocks)
     irblock = (ircfg.blocks[blks[-1]])
+    parent_blks = None
 
     if irblock_has_phi(irblock):
         for dst, sources in viewitems(irblock[0]):
@@ -146,6 +147,8 @@ def get_phi_vars(ircfg,loc_db,mdis):
                 phi_vars
             )
 
+    if not parent_blks:
+        return []
     for var, loc in parent_blks.items():
         irblock = ircfg.get_block(list(loc)[0])
         for asg in irblock:
@@ -194,8 +197,8 @@ def find_var_asg(ircfg,var,loc_db,mdis):
             res['false_next'] = phi_vals[1]
             val_list += phi_vals
         elif isinstance(src,ExprId) or isinstance(src, ExprOp):
-            phi_vals = get_phi_vars(ircfg,None,None)
-            if not phi_vals:
+            phi_vals = get_phi_vars(ircfg,loc_db,mdis)
+            if len(phi_vals) < 2:
                 continue
             res['true_next'] = phi_vals[0]
             res['false_next'] = phi_vals[1]
@@ -203,19 +206,29 @@ def find_var_asg(ircfg,var,loc_db,mdis):
     return res, val_list
 
 
+def get_assignment_parents(ircfg, label, index, reaching_defs):
+    assignblk_reaching_defs = reaching_defs.get_definitions(label, index)
+    assignblk = ircfg.get_block(label)[index]
+    for lval, expr in viewitems(assignblk):
+        read_vars = expr.get_r(mem_read=False)
+        for read_var in read_vars:
+            for reach in assignblk_reaching_defs.get(read_var, set()):
+                label, index = reach
+                return [assignblk] + get_assignment_parents(ircfg, label, index, reaching_defs)
+    return [assignblk]
+
+
 def find_state_var_usedefs(ircfg, search_var):
     var_addrs = set()
     reachings = ReachingDefinitions(ircfg)
-    digraph = DiGraphDefUse(reachings)
-    # the state var always a leaf
-    for leaf in digraph.leaves():
+    last_defs = list(reachings.items())[-1]
+    for var, location in last_defs[1].items():
+        label, index = next(iter(location))
         try:
-            if leaf.var.name.startswith(search_var):
-                for x in (digraph.reachable_parents(leaf)):
-                    var_addrs.add(ircfg.get_block(x.label)[x.index].instr.offset)
-        except AttributeError as e:
+            var.name
+        except AttributeError:
             continue
-    if not var_addrs:
-        for assignblk in _find_var_asg(ircfg, search_var):
-            var_addrs.add(assignblk.instr.offset)
+        if var.name.startswith(search_var):
+            for parent in get_assignment_parents(ircfg, label, index, reachings):
+                var_addrs.add(parent.instr.offset)
     return var_addrs
