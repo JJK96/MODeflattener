@@ -1,7 +1,18 @@
 # MODeflattener
 ***Miasm's Ollvm Deflattener***  
 > MODeflattener deobfuscates control flow flattened functions obfuscated by [OLLVM](https://github.com/obfuscator-llvm/obfuscator) using [Miasm](https://github.com/cea-sec/miasm).  
-https://mrt4ntr4.github.io/MODeflattener/  
+https://mrt4ntr4.github.io/MODeflattener/
+
+I made some major changes to the logic employed by mrt4ntr4.
+My version aims to support multiple state variables (but still breaks on some functions), it determines the state variable in use by checking which variable the next basic block compares with.
+mrt4ntr4's function assumes that there is a separate basic block called the pre-dispatcher, which is between the relevant blocks and the dispatcher. In the binary I was analysing, this basic block is missing and the relevant blocks jump immediately to the dispatcher.
+To overcome this problem, my version does not rely on finding the dispatcher, but instead just starts at the function start and adds each successor block to the todo-list.
+For each block, the code checks what the state variable is (as described above) and checks if there are any writes to the state variable.
+If there are writes, the next block should be looked up in the backbone.
+If the state variable is not used, the next block should just be the one following it in the CFG.
+I also changed the logic for detecting "useless instructions", namely the ones used for the CFF. mrt4ntr4's version does this by using a Def-Use graph. The problem with this that I encountered is that in many cases, the state variable is not actually used in the block, and therefore does not appear in the graph. To resolve this, I copied some functionality from Miasm's Def-Use graph to implement my own logic. I look at the last instruction in the ReachableDefinitions, and then follow the chain of instructions that influence the state variable.
+
+I currently gave up on the project because I encountered many edge cases and it is taking me too much time at this point. In addition, due to al the edge cases and assumptions about the shape of the CFF, I cannot guarantee the correctness of the resulting output, which hinders analysis.
 
 Flattened Flow             |  Deflattened Flow
 :-------------------------:|:-------------------------:
