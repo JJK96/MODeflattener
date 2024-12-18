@@ -520,6 +520,73 @@ def find_last_instr(block, mnem_prefix):
     return None
 
 
+def deflatten(asmcfg, ircfg, dispatcher_key):
+    dispatcher = asmcfg.loc_key_to_block(dispatcher_key)
+    state_var = dispatcher.lines[0].args[0]
+    relevant_blocks, backbone = analyze_cff(ircfg, lifter, state_var, dispatcher_key)
+    edges_to_delete = []
+    new_edges = []
+    for src, dst in asmcfg.edges():
+        if dst == dispatcher_key:
+            edges_to_delete.append((src, dst))
+            offset = loc_db.get_location_offset(src)
+            src_block = asmcfg.loc_key_to_block(src)
+            my_loc_db = LocationDB()
+            my_mdis = machine.dis_engine(cont.bin_stream, loc_db=my_loc_db)
+            my_mdis.dis_block_callback = stop_on_jmp
+            my_asmcfg = my_mdis.dis_multiblock(offset)
+            my_lifter = get_lifter(machine.lifter)(my_loc_db)
+            my_ircfg = my_lifter.new_ircfg_from_asmcfg(my_asmcfg)
+           
+            if src_block.lines[-1].name.startswith('J') and src_block.lines[-1].name != 'JMP':
+                # Has a conditional jump, this is not a relevant block
+                continue
+            index = len(src_block.lines)-1
+            usedefs = find_state_var_usedefs(my_ircfg, state_var.name)
+
+            my_ircfg_head = my_ircfg.heads()[0]
+            ssa_simplifier = IRCFGSimplifierSSA(my_lifter)
+            ssa = ssa_simplifier.ircfg_to_ssa(my_ircfg, my_ircfg_head)
+            #we only use do_propagate_expressions ssa simp pass
+            ssa_simplifier.do_propagate_expressions(ssa, my_ircfg_head)
+            var_asg, tmpval_list = find_var_asg(my_ircfg,state_var.name,my_loc_db,my_mdis)
+            new_lines = []
+            for instr in src_block.lines:
+                if instr.offset not in usedefs:
+                    new_lines.append(instr)
+            if len(var_asg) == 1:
+                to = relevant_blocks[var_asg['next']]
+                src_block.bto = set([AsmConstraint(to, c_t=AsmConstraint.c_to)])
+                #new_edges.append((src, to, AsmConstraint(src, c_t=AsmConstraint.c_to)))
+                jmp = ('JMP', to)
+            elif len(var_asg) > 1:
+                cond = find_last_instr(src_block, "CMOV")
+                true_next = relevant_blocks[var_asg['true_next']]
+                false_next = relevant_blocks[var_asg['false_next']]
+                jmp = (cond.name.replace('CMOV', 'J'), true_next)
+                src_block.bto = set([AsmConstraint(true_next, c_t=AsmConstraint.c_to), AsmConstraint(false_next, c_t=AsmConstraint.c_next)])
+                #new_edges.append((src, true_next, ))
+                #new_edges.append((src, false_next, ))
+            else:
+                breakpoint()
+                raise Exception("No assignments to state variable")
+            if new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
+                # Jump to dispatcher should be replaced by conditional jump
+                instr = new_lines[-1]
+                name, to = jmp
+                instr.name = name
+                instr.args[0] = ExprLoc(to, instr.args[0].size)
+            src_block.lines = new_lines
+
+    # for src, dst in edges_to_delete:
+    #     asmcfg.del_edge(src, dst)
+    for loc in backbone:
+        asmcfg.del_node(loc)
+    for src, dst, const in new_edges:
+        asmcfg.add_edge(src, dst, const)
+    asmcfg.rebuild_edges()
+
+
 if __name__ == '__main__':
     parser = ArgumentParser("modeflattener")
     parser.add_argument('filename', help="file to deobfuscate")
@@ -585,70 +652,7 @@ if __name__ == '__main__':
             break
     assert dispatcher is not None
     assert dispatcher.lines[0].name == 'CMP'
-    state_var = dispatcher.lines[0].args[0]
-    relevant_blocks, backbone = analyze_cff(ircfg, lifter, state_var, dispatcher_key)
-    predecessors = asmcfg.predecessors(dispatcher_key)
-    edges_to_delete = []
-    new_edges = []
-    for src, dst in asmcfg.edges():
-        if dst == dispatcher_key:
-            edges_to_delete.append((src, dst))
-            offset = loc_db.get_location_offset(src)
-            src_block = asmcfg.loc_key_to_block(src)
-            my_loc_db = LocationDB()
-            my_mdis = machine.dis_engine(cont.bin_stream, loc_db=my_loc_db)
-            my_mdis.dis_block_callback = stop_on_jmp
-            my_asmcfg = my_mdis.dis_multiblock(offset)
-            my_lifter = get_lifter(machine.lifter)(my_loc_db)
-            my_ircfg = my_lifter.new_ircfg_from_asmcfg(my_asmcfg)
-           
-            if src_block.lines[-1].name.startswith('J') and src_block.lines[-1].name != 'JMP':
-                # Has a conditional jump, this is not a relevant block
-                continue
-            index = len(src_block.lines)-1
-            usedefs = find_state_var_usedefs(my_ircfg, state_var.name)
-
-            my_ircfg_head = my_ircfg.heads()[0]
-            ssa_simplifier = IRCFGSimplifierSSA(my_lifter)
-            ssa = ssa_simplifier.ircfg_to_ssa(my_ircfg, my_ircfg_head)
-            #we only use do_propagate_expressions ssa simp pass
-            ssa_simplifier.do_propagate_expressions(ssa, my_ircfg_head)
-            var_asg, tmpval_list = find_var_asg(my_ircfg,state_var.name,my_loc_db,my_mdis)
-            new_lines = []
-            for instr in src_block.lines:
-                if instr.offset not in usedefs:
-                    new_lines.append(instr)
-            if len(var_asg) == 1:
-                to = relevant_blocks[var_asg['next']]
-                src_block.bto = set([AsmConstraint(to, c_t=AsmConstraint.c_to)])
-                #new_edges.append((src, to, AsmConstraint(src, c_t=AsmConstraint.c_to)))
-                jmp = ('JMP', to)
-            elif len(var_asg) > 1:
-                cond = find_last_instr(src_block, "CMOV")
-                true_next = relevant_blocks[var_asg['true_next']]
-                false_next = relevant_blocks[var_asg['false_next']]
-                jmp = (cond.name.replace('CMOV', 'J'), true_next)
-                src_block.bto = set([AsmConstraint(true_next, c_t=AsmConstraint.c_to), AsmConstraint(false_next, c_t=AsmConstraint.c_next)])
-                #new_edges.append((src, true_next, ))
-                #new_edges.append((src, false_next, ))
-            else:
-                breakpoint()
-                raise Exception("No assignments to state variable")
-            if new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
-                # Jump to dispatcher should be replaced by conditional jump
-                instr = new_lines[-1]
-                name, to = jmp
-                instr.name = name
-                instr.args[0] = ExprLoc(to, instr.args[0].size)
-            src_block.lines = new_lines
-
-    # for src, dst in edges_to_delete:
-    #     asmcfg.del_edge(src, dst)
-    for loc in backbone:
-        asmcfg.del_node(loc)
-    for src, dst, const in new_edges:
-        asmcfg.add_edge(src, dst, const)
-    asmcfg.rebuild_edges()
+    deflatten(asmcfg, ircfg, dispatcher_key)
     from util import to_clip
     to_clip(asmcfg.dot())
     breakpoint()
