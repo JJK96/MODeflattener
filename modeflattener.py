@@ -1,13 +1,19 @@
 from future.utils import viewitems, viewvalues
 from miasm.analysis.binary import Container
 from miasm.analysis.machine import Machine
-from miasm.core.locationdb import LocationDB
+from miasm.core.locationdb import LocationDB, LocKey
 from miasm.analysis.simplifier import *
 from miasm.expression.expression import *
 from miasm.core.asmblock import *
-from miasm.arch.x86.arch import mn_x86
+from miasm.arch.x86.arch import mn_x86, instruction_x86
 from miasm.core.utils import encode_hex
 from collections import defaultdict, OrderedDict
+from miasm.ir.symbexec import SymbolicExecutionEngine
+from miasm.analysis.sandbox import Sandbox_Win_x86_32
+from miasm.analysis.dse import DSEPathConstraint
+from miasm.ir.translators.z3_ir import Translator
+import z3
+import copy
 
 from argparse import ArgumentParser
 import time
@@ -29,6 +35,9 @@ def setup_logger(loglevel):
 
     return logger
 
+def get_dominated(dominator_tree, block_key):
+    return set([block_key] + [b for b in dominator_tree.walk_depth_first_forward(block_key)])
+
 # https://synthesis.to/2021/03/15/control_flow_analysis.html
 def calc_flattening_score(asm_graph):
     score = 0.0
@@ -38,8 +47,7 @@ def calc_flattening_score(asm_graph):
             if len(block.lines) == 0:
                 return score
             block_key = asm_graph.loc_db.get_offset_location(block.lines[0].offset)
-            dominated = set(
-                [block_key] + [b for b in dominator_tree.walk_depth_first_forward(block_key)])
+            dominated = get_dominated(dominator_tree, block_key)
             if not any([b in dominated for b in asm_graph.predecessors(block_key)]):
                 continue
             score = max(score, len(dominated)/len(asm_graph.nodes()))
@@ -145,7 +153,7 @@ def deflat(ad, func_info):
         asmcfg = mdis.dis_multiblock(addr)
         for block in asmcfg.blocks:
             done.add(asmcfg.loc_db.get_location_offset(block.loc_key))
-        state_var = get_state_var(asmcfg, main_asmcfg)
+        state_var = 'EAX' #get_state_var(asmcfg, main_asmcfg)
         if not state_var:
             block_offset = list(asmcfg.blocks)[-1].get_range()[0]
             block = main_asmcfg.getby_offset(block_offset)
@@ -246,6 +254,18 @@ def deflat(ad, func_info):
         _log.debug('patch generated %s\n' % encode_hex(patch))
 
     return patches
+
+
+class myinstruction(instruction_x86):
+    def breakflow(self):
+        if self.name in ['CALL']:
+            return False
+        return super().breakflow()
+
+    def splitflow(self):
+        if self.name in ['CALL']:
+            return False
+        return super().splitflow()
 
 
 def deflat1(ad, func_info):
@@ -400,6 +420,106 @@ def deflat1(ad, func_info):
     return patches
 
 
+def get_block_num(asmcfg, key):
+    pred_key = asmcfg.predecessors(key)[0]
+    pred = asmcfg.loc_key_to_block(pred_key)
+    if len(pred.lines) == 1 and pred.lines[0].name == 'JMP':
+        # Predecessor is a JMP placeholder
+        pred_key = asmcfg.predecessors(pred_key)[0]
+        pred = asmcfg.loc_key_to_block(pred_key)
+    for line in pred.lines:
+        if line.name == 'CMP':
+            return line.args[1].arg
+    return None 
+
+
+class State:
+    state = {}
+    addr = None
+    constraints = []
+
+    def __init__(self, addr):
+        self.addr = addr
+
+    @property
+    def solver(self):
+        solver = z3.Solver()
+        for c in self.constraints:
+            solver.add(c)
+        return solver
+
+    def eval_one(self, expr):
+        solver = self.solver
+        if solver.check().r < 0:
+            raise Exception("Unsat")
+        solution = solver.model().eval(expr)
+        if solution == expr:
+            # Fully unconstrained
+            return False
+        solver.add(expr != solution)
+        if solver.check().r > 0:
+            # More than 1 solution
+            return False
+        else:
+            return solution.as_long()
+
+    def copy(self, addr):
+        new_state = State(addr)
+        new_state.state = copy.deepcopy(self.state)
+        new_state.constraints = copy.deepcopy(self.constraints)
+        return new_state
+
+
+def analyze_cff(ircfg, lifter, state_var, dispatcher_key):
+    dispatcher_addr = ircfg.loc_db.get_location_offset(dispatcher_key)
+    translator = Translator.to_language('z3')
+    state_queue = [State(dispatcher_addr)]
+    done = set()
+    z3_state_var = translator.from_expr(state_var)
+    relevant_blocks = {}
+    backbone = set()
+    while state_queue:
+        state = state_queue.pop(0)
+        done.add(state.addr)
+        loc = ircfg.loc_db.get_offset_location(state.addr)
+        block = ircfg.get_block(loc)
+        val = state.eval_one(z3_state_var)
+        if val:
+            relevant_blocks[val] = loc
+            continue
+        else:
+            backbone.add(loc)
+        se = SymbolicExecutionEngine(lifter, state.state)
+        addr = se.run_block_at(ircfg, loc)
+        if addr.is_cond():
+            for succ in [addr.src1, addr.src2]:
+                if succ.arg in done:
+                    continue
+                new_state = state.copy(succ.arg)
+                translated = translator.from_expr(addr)
+                new_state.constraints.append(translated == succ.arg)
+                state_queue.append(new_state)
+        else:
+            raise Exception("This should not happen")
+    return relevant_blocks, backbone 
+
+
+def get_lifter(lifter):
+    class MyLifter(lifter):
+        def get_ir(self, instr):
+            if instr.name == 'CALL':
+                instr = instr.__class__('NOP', instr.mode, instr.args, instr.additional_info)
+            return super().get_ir(instr)
+    return MyLifter
+
+
+def find_last_instr(block, mnem_prefix):
+    for instr in block.lines[::-1]:
+        if instr.name.startswith(mnem_prefix):
+            return instr
+    return None
+
+
 if __name__ == '__main__':
     parser = ArgumentParser("modeflattener")
     parser.add_argument('filename', help="file to deobfuscate")
@@ -443,64 +563,92 @@ if __name__ == '__main__':
 
     text_offset = cont.bin_stream.bin.virt.parent.SHList.shlist[0].offset
     machine = Machine(cont.arch)
+    mn_x86.instruction = myinstruction
     mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
+    lifter = get_lifter(machine.lifter)(loc_db)
 
     ad = int(args.address, 0)
-    todo = [(mdis, None, ad)]
-    done = set()
-    all_funcs = set()
-    all_funcs_blocks = {}
+    asmcfg = mdis.dis_multiblock(ad)
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    head = asmcfg.heads()[0]
 
-    while todo:
-        mdis, caller, ad = todo.pop(0)
-        if ad in done:
-            continue
-        done.add(ad)
-        asmcfg = mdis.dis_multiblock(ad)
-        lifter = machine.lifter_model_call(mdis.loc_db)
-        ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    dominators = asmcfg.compute_dominators(head)
+    back_edges = defaultdict(list)
+    for src, dest in asmcfg.compute_back_edges(head):
+        back_edges[dest].append(src)
 
-        _log.info('found func @ %#x (%d)' % (ad, len(all_funcs)))
+    for key in asmcfg.walk_depth_first_forward(head):
+        if key in back_edges.keys():
+            # Has a back edge
+            dispatcher_key = key
+            dispatcher = asmcfg.loc_key_to_block(key)
+            break
+    assert dispatcher is not None
+    assert dispatcher.lines[0].name == 'CMP'
+    state_var = dispatcher.lines[0].args[0]
+    relevant_blocks, backbone = analyze_cff(ircfg, lifter, state_var, dispatcher_key)
+    predecessors = asmcfg.predecessors(dispatcher_key)
+    edges_to_delete = []
+    new_edges = []
+    for src, dst in asmcfg.edges():
+        if dst == dispatcher_key:
+            edges_to_delete.append((src, dst))
+            offset = loc_db.get_location_offset(src)
+            src_block = asmcfg.loc_key_to_block(src)
+            my_loc_db = LocationDB()
+            my_mdis = machine.dis_engine(cont.bin_stream, loc_db=my_loc_db)
+            my_mdis.dis_block_callback = stop_on_jmp
+            my_asmcfg = my_mdis.dis_multiblock(offset)
+            my_lifter = get_lifter(machine.lifter)(my_loc_db)
+            my_ircfg = my_lifter.new_ircfg_from_asmcfg(my_asmcfg)
+           
+            if src_block.lines[-1].name.startswith('J') and src_block.lines[-1].name != 'JMP':
+                # Has a conditional jump, this is not a relevant block
+                continue
+            index = len(src_block.lines)-1
+            usedefs = find_state_var_usedefs(my_ircfg, state_var.name)
 
-        all_funcs.add(ad)
-        all_funcs_blocks[ad] = (asmcfg, ircfg)
-
-        if args.all:
-            for block in asmcfg.blocks:
-                instr = block.get_subcall_instr()
-                if not instr:
-                    continue
-                for dest in instr.getdstflow(mdis.loc_db):
-                    if not dest.is_loc():
-                        continue
-                    offset = mdis.loc_db.get_location_offset(dest.loc_key)
-                    todo.append((mdis, instr, offset))
-
-    for ad in all_funcs:
-        asmcfg = all_funcs_blocks[ad][0]
-        score = calc_flattening_score(asmcfg)
-        if score > 0.9:
-            print('-------------------------')
-            print('|    func : %#x    |' % ad)
-            print('-------------------------')
-            fcn_start_time = time.time()
-            patches = deflat(ad, all_funcs_blocks[ad])
-
-            if patches:
-                for offset, data in patches.items():
-                    # print_disassembly(data)
-                    fpatch.seek(offset - baseaddr + text_offset)
-                    fpatch.write(data)
-
-                fcn_end_time = time.time() - fcn_start_time
-                _log.info("PATCHING SUCCESSFUL for function @ %#x (%.2f secs)\n" % (ad, fcn_end_time))
+            my_ircfg_head = my_ircfg.heads()[0]
+            ssa_simplifier = IRCFGSimplifierSSA(my_lifter)
+            ssa = ssa_simplifier.ircfg_to_ssa(my_ircfg, my_ircfg_head)
+            #we only use do_propagate_expressions ssa simp pass
+            ssa_simplifier.do_propagate_expressions(ssa, my_ircfg_head)
+            var_asg, tmpval_list = find_var_asg(my_ircfg,state_var.name,my_loc_db,my_mdis)
+            new_lines = []
+            for instr in src_block.lines:
+                if instr.offset not in usedefs:
+                    new_lines.append(instr)
+            if len(var_asg) == 1:
+                to = relevant_blocks[var_asg['next']]
+                src_block.bto = set([AsmConstraint(to, c_t=AsmConstraint.c_to)])
+                #new_edges.append((src, to, AsmConstraint(src, c_t=AsmConstraint.c_to)))
+                jmp = ('JMP', to)
+            elif len(var_asg) > 1:
+                cond = find_last_instr(src_block, "CMOV")
+                true_next = relevant_blocks[var_asg['true_next']]
+                false_next = relevant_blocks[var_asg['false_next']]
+                jmp = (cond.name.replace('CMOV', 'J'), true_next)
+                src_block.bto = set([AsmConstraint(true_next, c_t=AsmConstraint.c_to), AsmConstraint(false_next, c_t=AsmConstraint.c_next)])
+                #new_edges.append((src, true_next, ))
+                #new_edges.append((src, false_next, ))
             else:
-                _log.error("PATCHING UNSUCCESSFUL for function @ %#x\n" % ad)
+                breakpoint()
+                raise Exception("No assignments to state variable")
+            if new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
+                # Jump to dispatcher should be replaced by conditional jump
+                instr = new_lines[-1]
+                name, to = jmp
+                instr.name = name
+                instr.args[0] = ExprLoc(to, instr.args[0].size)
+            src_block.lines = new_lines
 
-        else:
-            _log.error("unable to deobfuscate func %#x (cff score = %f)\n" % (ad, score))
-
-    fpatch.close()
-    deobf_end_time = time.time() - deobf_start_time
-
-    _log.info("Deobfuscated file saved at '%s' (Total Time Taken : %.2f secs)" % (args.patch_filename, deobf_end_time))
+    # for src, dst in edges_to_delete:
+    #     asmcfg.del_edge(src, dst)
+    for loc in backbone:
+        asmcfg.del_node(loc)
+    for src, dst, const in new_edges:
+        asmcfg.add_edge(src, dst, const)
+    asmcfg.rebuild_edges()
+    from util import to_clip
+    to_clip(asmcfg.dot())
+    breakpoint()

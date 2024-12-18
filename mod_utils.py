@@ -203,7 +203,11 @@ def find_var_asg(ircfg,var,loc_db,mdis):
             res['true_next'] = phi_vals[0]
             res['false_next'] = phi_vals[1]
             val_list += phi_vals
-    return res, val_list
+    return res, val_list 
+
+
+class Def:
+    parents = []
 
 
 def get_assignment_parents(ircfg, label, index, reaching_defs):
@@ -215,20 +219,32 @@ def get_assignment_parents(ircfg, label, index, reaching_defs):
             for reach in assignblk_reaching_defs.get(read_var, set()):
                 label, index = reach
                 return [assignblk] + get_assignment_parents(ircfg, label, index, reaching_defs)
-    return [assignblk]
+    return [assignblk] 
+
+
+def get_last_reaching_defs(ircfg, reachings):
+    highest_index = 0
+    last_block = ircfg.leaves()[0]
+    if ircfg.get_block(last_block) is None:
+        last_block = ircfg.predecessors(last_block)[0]
+    for key, defs in reachings.items():
+        label, index = key
+        if label == last_block and index > highest_index:
+            highest_index = index
+    return reachings.get_definitions(last_block, highest_index)
 
 
 def find_state_var_usedefs(ircfg, search_var):
     var_addrs = set()
     reachings = ReachingDefinitions(ircfg)
-    last_defs = list(reachings.items())[-1]
-    for var, location in last_defs[1].items():
-        label, index = next(iter(location))
-        try:
-            var.name
-        except AttributeError:
-            continue
-        if var.name.startswith(search_var):
-            for parent in get_assignment_parents(ircfg, label, index, reachings):
-                var_addrs.add(parent.instr.offset)
+    last_defs = get_last_reaching_defs(ircfg, reachings)
+    for var, location in last_defs.items():
+        for label, index in location:
+            try:
+                var.name
+            except AttributeError:
+                continue
+            if var.name.startswith(search_var):
+                for parent in get_assignment_parents(ircfg, label, index, reachings):
+                    var_addrs.add(parent.instr.offset)
     return var_addrs
