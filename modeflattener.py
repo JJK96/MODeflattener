@@ -541,7 +541,6 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
             if src_block.lines[-1].name.startswith('J') and src_block.lines[-1].name != 'JMP':
                 # Has a conditional jump, this is not a relevant block
                 continue
-            index = len(src_block.lines)-1
             usedefs = find_state_var_usedefs(my_ircfg, state_var.name)
 
             my_ircfg_head = my_ircfg.heads()[0]
@@ -557,7 +556,6 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
             if len(var_asg) == 1:
                 to = relevant_blocks[var_asg['next']]
                 src_block.bto = set([AsmConstraint(to, c_t=AsmConstraint.c_to)])
-                #new_edges.append((src, to, AsmConstraint(src, c_t=AsmConstraint.c_to)))
                 jmp = ('JMP', to)
             elif len(var_asg) > 1:
                 cond = find_last_instr(src_block, "CMOV")
@@ -565,12 +563,9 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
                 false_next = relevant_blocks[var_asg['false_next']]
                 jmp = (cond.name.replace('CMOV', 'J'), true_next)
                 src_block.bto = set([AsmConstraint(true_next, c_t=AsmConstraint.c_to), AsmConstraint(false_next, c_t=AsmConstraint.c_next)])
-                #new_edges.append((src, true_next, ))
-                #new_edges.append((src, false_next, ))
             else:
-                breakpoint()
                 raise Exception("No assignments to state variable")
-            if new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
+            if new_lines and new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
                 # Jump to dispatcher should be replaced by conditional jump
                 instr = new_lines[-1]
                 name, to = jmp
@@ -585,6 +580,22 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
     for src, dst, const in new_edges:
         asmcfg.add_edge(src, dst, const)
     asmcfg.rebuild_edges()
+
+
+def find_dispatcher(asmcfg):
+    head = LocKey(0)
+    back_edges = defaultdict(list)
+    for src, dest in asmcfg.compute_back_edges(head):
+        back_edges[dest].append(src)
+
+    for key in asmcfg.walk_depth_first_forward(head):
+        if key in back_edges.keys():
+            # Has a back edge
+            block = asmcfg.loc_key_to_block(key)
+            if not block.lines or not block.lines[0].name == 'CMP':
+                continue
+            return key
+    return None
 
 
 if __name__ == '__main__':
@@ -639,20 +650,10 @@ if __name__ == '__main__':
     ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
     head = asmcfg.heads()[0]
 
-    dominators = asmcfg.compute_dominators(head)
-    back_edges = defaultdict(list)
-    for src, dest in asmcfg.compute_back_edges(head):
-        back_edges[dest].append(src)
-
-    for key in asmcfg.walk_depth_first_forward(head):
-        if key in back_edges.keys():
-            # Has a back edge
-            dispatcher_key = key
-            dispatcher = asmcfg.loc_key_to_block(key)
+    while True:
+        dispatcher_key = find_dispatcher(asmcfg)
+        if not dispatcher_key:
             break
-    assert dispatcher is not None
-    assert dispatcher.lines[0].name == 'CMP'
-    deflatten(asmcfg, ircfg, dispatcher_key)
+        deflatten(asmcfg, ircfg, dispatcher_key)
     from util import to_clip
     to_clip(asmcfg.dot())
-    breakpoint()
