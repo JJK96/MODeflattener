@@ -471,6 +471,7 @@ class State:
 
 
 def analyze_cff(ircfg, lifter, state_var, dispatcher_key):
+    print("Analyzing cff")
     dispatcher_addr = ircfg.loc_db.get_location_offset(dispatcher_key)
     translator = Translator.to_language('z3')
     state_queue = [State(dispatcher_addr)]
@@ -520,16 +521,17 @@ def find_last_instr(block, mnem_prefix):
     return None
 
 
-def deflatten(asmcfg, ircfg, dispatcher_key):
+def deflatten(cont, machine, asmcfg, ircfg, lifter, dispatcher_key):
     dispatcher = asmcfg.loc_key_to_block(dispatcher_key)
     state_var = dispatcher.lines[0].args[0]
     relevant_blocks, backbone = analyze_cff(ircfg, lifter, state_var, dispatcher_key)
     edges_to_delete = []
     new_edges = []
+    print("Processing the blocks")
     for src, dst in asmcfg.edges():
         if dst == dispatcher_key:
             edges_to_delete.append((src, dst))
-            offset = loc_db.get_location_offset(src)
+            offset = asmcfg.loc_db.get_location_offset(src)
             src_block = asmcfg.loc_key_to_block(src)
             my_loc_db = LocationDB()
             my_mdis = machine.dis_engine(cont.bin_stream, loc_db=my_loc_db)
@@ -555,14 +557,20 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
                     new_lines.append(instr)
             if len(var_asg) == 1:
                 to = relevant_blocks[var_asg['next']]
-                src_block.bto = set([AsmConstraint(to, c_t=AsmConstraint.c_to)])
+                const = AsmConstraint(to, c_t=AsmConstraint.c_to)
+                src_block.bto = set([const])
                 jmp = ('JMP', to)
+                new_edges.append((src, to, const))
             elif len(var_asg) > 1:
                 cond = find_last_instr(src_block, "CMOV")
                 true_next = relevant_blocks[var_asg['true_next']]
                 false_next = relevant_blocks[var_asg['false_next']]
                 jmp = (cond.name.replace('CMOV', 'J'), true_next)
-                src_block.bto = set([AsmConstraint(true_next, c_t=AsmConstraint.c_to), AsmConstraint(false_next, c_t=AsmConstraint.c_next)])
+                true_const = AsmConstraint(true_next, c_t=AsmConstraint.c_to)
+                false_const = AsmConstraint(false_next, c_t=AsmConstraint.c_next)
+                src_block.bto = set([true_const, false_const])
+                new_edges.append((src, true_next, true_const))
+                new_edges.append((src, false_next, false_const))
             else:
                 raise Exception("No assignments to state variable")
             if new_lines and new_lines[-1].name == 'JMP' and new_lines[-1].args[0].loc_key == dispatcher_key:
@@ -573,13 +581,12 @@ def deflatten(asmcfg, ircfg, dispatcher_key):
                 instr.args[0] = ExprLoc(to, instr.args[0].size)
             src_block.lines = new_lines
 
-    # for src, dst in edges_to_delete:
-    #     asmcfg.del_edge(src, dst)
+    for src, dst in edges_to_delete:
+        asmcfg.del_edge(src, dst)
     for loc in backbone:
         asmcfg.del_node(loc)
     for src, dst, const in new_edges:
         asmcfg.add_edge(src, dst, const)
-    asmcfg.rebuild_edges()
 
 
 def find_dispatcher(asmcfg):
@@ -598,7 +605,56 @@ def find_dispatcher(asmcfg):
     return None
 
 
-if __name__ == '__main__':
+
+def main(_log, filename, patch_filename, baseaddr, address):
+    forg = open(filename, 'rb')
+    fpatch = open(patch_filename, 'wb')
+    fpatch.write(forg.read())
+
+    loc_db = LocationDB()
+
+    cont = Container.from_stream(open(filename, 'rb'), loc_db)
+
+    supported_arch = ['x86_32', 'x86_64']
+    _log.info("Architecture : %s"  % cont.arch)
+
+    if cont.arch not in supported_arch:
+        _log.error("Architecture unsupported : %s" % cont.arch)
+        exit(1)
+    if not baseaddr:
+        section_ep = cont.bin_stream.bin.virt.parent.getsectionbyvad(cont.entry_point)
+        baseaddr = section_ep.addr - section_ep.offset
+
+    _log.info('Base Address:%x'%baseaddr)
+
+    text_offset = cont.bin_stream.bin.virt.parent.SHList.shlist[0].offset
+    machine = Machine(cont.arch)
+    mn_x86.instruction = myinstruction
+    mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
+    lifter = get_lifter(machine.lifter)(loc_db)
+
+    ad = address
+    print("Generating asm")
+    asmcfg = mdis.dis_multiblock(ad)
+    print("Lifting")
+    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
+    head = asmcfg.heads()[0]
+
+    print("Searching dispatcher")
+
+    while True:
+        dispatcher_key = find_dispatcher(asmcfg)
+        if not dispatcher_key:
+            break
+        print("Found dispatcher, deflattening")
+        deflatten(cont, machine, asmcfg, ircfg, lifter, dispatcher_key)
+        break
+
+    return asmcfg
+
+
+
+if __name__ == "__main__":
     parser = ArgumentParser("modeflattener")
     parser.add_argument('filename', help="file to deobfuscate")
     parser.add_argument('patch_filename', help="deobfuscated file name")
@@ -616,44 +672,5 @@ if __name__ == '__main__':
 
     deobf_start_time = time.time()
 
-    forg = open(args.filename, 'rb')
-    fpatch = open(args.patch_filename, 'wb')
-    fpatch.write(forg.read())
+    asmcfg = main(_log, args.filename, args.patch_filename, args.baseaddr, args.address)
 
-    loc_db = LocationDB()
-
-    global cont
-    cont = Container.from_stream(open(args.filename, 'rb'), loc_db)
-
-    supported_arch = ['x86_32', 'x86_64']
-    _log.info("Architecture : %s"  % cont.arch)
-
-    if cont.arch not in supported_arch:
-        _log.error("Architecture unsupported : %s" % cont.arch)
-        exit(1)
-    if args.baseaddr:
-        _log.info('Base Address:'+args.baseaddr)
-        baseaddr=int(args.baseaddr,16)
-    else:
-        section_ep = cont.bin_stream.bin.virt.parent.getsectionbyvad(cont.entry_point)
-        baseaddr = section_ep.addr - section_ep.offset
-        _log.info('Base Address:%x'%baseaddr)
-
-    text_offset = cont.bin_stream.bin.virt.parent.SHList.shlist[0].offset
-    machine = Machine(cont.arch)
-    mn_x86.instruction = myinstruction
-    mdis = machine.dis_engine(cont.bin_stream, loc_db=loc_db)
-    lifter = get_lifter(machine.lifter)(loc_db)
-
-    ad = int(args.address, 0)
-    asmcfg = mdis.dis_multiblock(ad)
-    ircfg = lifter.new_ircfg_from_asmcfg(asmcfg)
-    head = asmcfg.heads()[0]
-
-    while True:
-        dispatcher_key = find_dispatcher(asmcfg)
-        if not dispatcher_key:
-            break
-        deflatten(asmcfg, ircfg, dispatcher_key)
-    from util import to_clip
-    to_clip(asmcfg.dot())
